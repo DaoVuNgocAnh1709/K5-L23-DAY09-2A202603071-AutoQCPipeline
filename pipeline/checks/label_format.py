@@ -25,5 +25,49 @@ from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
 
 
 def run(ds, cfg):
-    # TODO: duyệt từng file nhãn, từng dòng
-    raise NotImplementedError("check label_format chưa làm")
+    c = cfg["label_format"]
+    tol = c["overflow_tol"]
+    min_px = c["min_box_px"]
+    max_frac = c["max_box_frac"]
+    dup_iou = c["dup_box_iou"]
+    n_cls = len(ds.classes)
+    issues = []
+
+    for lf in ds.label_files():
+        stem = lf.stem
+        size = ds.image_size(stem)
+        seen = []
+        for line_no, text in ds.read_label_lines(stem) or []:
+            try:
+                cls_id, cx, cy, w, h = parse_yolo_line(text)
+            except ValueError as e:
+                issues.append(Issue("label_format", ERROR, "BAD_FORMAT", stem, f"sai định dạng: {e}", line=line_no))
+                continue
+
+            if not (0 <= cls_id < n_cls):
+                issues.append(Issue("label_format", ERROR, "BAD_CLASS_ID", stem, f"id lớp {cls_id} ngoài 0..{n_cls - 1}", line=line_no))
+                continue
+
+            if w <= 0 or h <= 0:
+                issues.append(Issue("label_format", ERROR, "BOX_ZERO", stem, f"kích thước box <= 0 (w={w}, h={h})", line=line_no))
+                continue
+
+            box = (cx, cy, w, h)
+            x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+            over = max(0.0, -x1, -y1, x2 - 1.0, y2 - 1.0)
+            if over > tol:
+                issues.append(Issue("label_format", ERROR, "BOX_OUT_OF_IMAGE", stem, f"box tràn ảnh {over:.4f}", line=line_no, extra={"overflow": round(over, 6)}))
+
+            if any(p_cls == cls_id and iou_xywh(box, p_box) > dup_iou for p_cls, p_box in seen):
+                issues.append(Issue("label_format", ERROR, "DUP_BOX", stem, f"box trùng lặp cùng lớp {cls_id}", line=line_no))
+            seen.append((cls_id, box))
+
+            if size is not None:
+                short_px = min(w * size[0], h * size[1])
+                if short_px < min_px:
+                    issues.append(Issue("label_format", WARN, "BOX_TINY", stem, f"cạnh ngắn {short_px:.1f}px < {min_px}px", line=line_no))
+
+            if w * h > max_frac:
+                issues.append(Issue("label_format", WARN, "BOX_HUGE", stem, f"diện tích box {w * h:.3f} > {max_frac}", line=line_no))
+
+    return issues
