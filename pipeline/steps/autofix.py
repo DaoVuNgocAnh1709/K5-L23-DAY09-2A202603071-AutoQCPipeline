@@ -33,7 +33,150 @@ import yaml  # noqa: F401
 
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
+REMOVE_CODES = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+DROP_LINE_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+LINE_CODES = DROP_LINE_CODES | {"BOX_OUT_OF_IMAGE"}
+
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    err_issues = [i for i in issues if i.severity == ERROR]
+    fixes = []
+
+    # 1. Sửa tên lớp trong data.yaml
+    if any(i.code == "BAD_CLASS_NAME" for i in err_issues):
+        cur_names = ds.yaml_names()
+        expected = dict(enumerate(cfg["classes"]))
+        if cur_names != expected:
+            data = {}
+            if ds.yaml_path.exists():
+                data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+            before_str = str(data.get("names", cur_names))
+            data["names"] = expected
+            ds.yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            fixes.append({
+                "image": "data.yaml",
+                "line": "",
+                "action": "rename_classes",
+                "before": before_str,
+                "after": str(cfg["classes"]),
+            })
+
+    # 2. Xoá ảnh lỗi / trùng / rò rỉ
+    removed_stems = set()
+    for i in err_issues:
+        if i.code in REMOVE_CODES or i.code.startswith("DUP_IMAGE_"):
+            stem = i.image
+            if stem in removed_stems:
+                continue
+            removed_stems.add(stem)
+            img_p = ds.image_path(stem)
+            lbl_p = ds.label_path(stem)
+            existed = False
+            before_name = stem
+            if img_p is not None and img_p.exists():
+                before_name = img_p.name
+                img_p.unlink()
+                existed = True
+            if lbl_p.exists():
+                lbl_p.unlink()
+                existed = True
+            if existed:
+                fixes.append({
+                    "image": stem,
+                    "line": "",
+                    "action": "remove_image",
+                    "before": before_name,
+                    "after": "(đã xoá)",
+                })
+
+    # 3. Ghi nhận ảnh thiếu file nhãn (chuyển người gán, không tạo file rỗng)
+    needs_seen = set()
+    for i in err_issues:
+        if i.code == "MISSING_LABEL_FILE" and i.image not in removed_stems and i.image not in needs_seen:
+            needs_seen.add(i.image)
+            fixes.append({
+                "image": i.image,
+                "line": "",
+                "action": "needs_label",
+                "before": "(không có file)",
+                "after": "chuyển người gán",
+            })
+
+    # 4. Gom lỗi mức dòng theo từng file nhãn và sửa một lần trên số dòng gốc
+    by_image = defaultdict(lambda: defaultdict(set))
+    for i in err_issues:
+        if i.code in LINE_CODES and i.line is not None and i.image not in removed_stems:
+            by_image[i.image][i.line].add(i.code)
+
+    for stem, line_map in by_image.items():
+        lbl_p = ds.label_path(stem)
+        if not lbl_p.exists():
+            continue
+        orig_lines = lbl_p.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = []
+        changed = False
+
+        for idx, text in enumerate(orig_lines, 1):
+            codes = line_map.get(idx)
+            if not codes:
+                new_lines.append(text)
+                continue
+
+            if codes & DROP_LINE_CODES:
+                changed = True
+                fixes.append({
+                    "image": stem,
+                    "line": idx,
+                    "action": "drop_line",
+                    "before": text,
+                    "after": "",
+                })
+                continue
+
+            if "BOX_OUT_OF_IMAGE" in codes:
+                try:
+                    cls_id, cx, cy, w, h = parse_yolo_line(text)
+                except ValueError:
+                    changed = True
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": text,
+                        "after": "",
+                    })
+                    continue
+
+                x1 = max(0.0, cx - w / 2)
+                y1 = max(0.0, cy - h / 2)
+                x2 = min(1.0, cx + w / 2)
+                y2 = min(1.0, cy + h / 2)
+                nw, nh = x2 - x1, y2 - y1
+
+                if nw <= 0 or nh <= 0:
+                    changed = True
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": text,
+                        "after": "",
+                    })
+                else:
+                    ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+                    after_text = f"{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                    new_lines.append(after_text)
+                    changed = True
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "clip_box",
+                        "before": text,
+                        "after": after_text,
+                    })
+
+        if changed:
+            content = "\n".join(new_lines) + ("\n" if new_lines else "")
+            lbl_p.write_text(content, encoding="utf-8")
+
+    return fixes
